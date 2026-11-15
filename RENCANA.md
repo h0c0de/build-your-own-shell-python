@@ -39,4 +39,4 @@ panduan, bukan bagian dari port.
 
 - [x] Tiap irisan terbukti oleh skrip uji; final: baterai diff vs bash asli.
 - [x] `CATATAN.md` satu halaman per irisan: konsep inti + penyimpangan port.
-- [ ] Repo GitHub publik `build-your-own-shell-python` terbit & terverifikasi.
+- [x] Repo GitHub publik `build-your-own-shell-python` terbit & terverifikasi.
