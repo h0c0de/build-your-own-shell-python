@@ -1,0 +1,276 @@
+#!/usr/bin/env python3
+"""pysh — port Python dari lsh, shell C Stephen Brennan (2015).
+
+Struktur mengikuti panduan persis:
+  loop: baca baris -> pecah token -> eksekusi
+  builtin: cd, help, exit (berjalan di proses shell itu sendiri)
+  perintah luar: fork() -> execvp() di anak, waitpid() di induk
+
+Penyimpangan dari panduan (dicatat di CATATAN.md):
+  - Prompt "> " hanya dicetak bila stdin adalah terminal; panduan
+    mencetaknya selalu, yang mengotori keluaran mode skrip/pipa.
+  - Alokasi buffer dinamis C (malloc/realloc) tidak diperlukan di Python.
+
+Ekstensi di luar panduan:
+  - Irisan 2: tokenizer sadar quoting (kutip tunggal/ganda, backslash),
+    ditulis sendiri sebagai mesin keadaan — panduan sengaja
+    menghilangkannya. Ekspansi variabel ($HOME dsb.) tetap TIDAK
+    dilakukan; itu tahap pemrosesan shell yang berbeda.
+  - Irisan 3: pipe & redirection — operator | < > >> dikenali tokenizer
+    hanya di luar kutip; pipeline dijalankan sebagai rantai anak yang
+    dihubungkan os.pipe + os.dup2. Builtin hanya untuk perintah tunggal
+    tanpa pipe/redirection (di bash builtin dalam pipeline berjalan di
+    subshell; di pysh segmen pipeline selalu program luar).
+"""
+
+import os
+import sys
+
+
+def read_line():
+    """Satu baris dari stdin; None pada EOF (Ctrl-D / akhir berkas)."""
+    line = sys.stdin.readline()
+    if line == "":
+        return None
+    return line
+
+
+class KutipTakTertutup(Exception):
+    pass
+
+
+def split_line(line):
+    """Tokenizer sadar quoting (EKSTENSI Irisan 2; panduan hanya
+    memecah whitespace dengan strtok, tanpa quoting sama sekali).
+
+    Mesin keadaan tiga modus: di luar kutip, dalam kutip tunggal,
+    dalam kutip ganda — mengikuti aturan bash untuk subset ini:
+      - di luar kutip: whitespace memisahkan; \\ meng-escape 1 karakter
+      - kutip tunggal: semua literal sampai ' penutup, tanpa escape
+      - kutip ganda: literal sampai " penutup; \\ hanya meng-escape
+        $ ` " \\ dan newline, selain itu backslash tetap utuh
+    Fragmen yang bersebelahan menyatu jadi satu token (a"b"c -> abc),
+    dan kutip kosong menghasilkan token kosong ("" -> '')."""
+    token = []
+    tokens = []  # ("kata", teks) | ("op", simbol) — lihat parse_pipeline
+    ada_token = False
+    modus = None  # None | "'" | '"'
+    i = 0
+    while i < len(line):
+        c = line[i]
+        if modus is None:
+            if c in " \t\r\n":
+                if ada_token:
+                    tokens.append(("kata", "".join(token)))
+                    token, ada_token = [], False
+            elif c in "|<>" and not token:
+                # Operator Irisan 3: hanya bila tidak sedang menyusun
+                # token (di tengah token, mis. nama berkas "a>b",
+                # karakter ini literal — penyederhanaan sadar; bash
+                # memisahkannya juga di tengah kata). Operator WAJIB
+                # bertipe "op": "|" hasil kutip adalah kata biasa.
+                if ada_token:  # fragmen kutip kosong yang menggantung
+                    tokens.append(("kata", ""))
+                    ada_token = False
+                if c == ">" and i + 1 < len(line) and line[i + 1] == ">":
+                    tokens.append(("op", ">>"))
+                    i += 1
+                else:
+                    tokens.append(("op", c))
+            elif c == "\\":
+                i += 1
+                if i < len(line):
+                    token.append(line[i])
+                    ada_token = True
+            elif c in "'\"":
+                modus = c
+                ada_token = True
+            else:
+                token.append(c)
+                ada_token = True
+        elif modus == "'":
+            if c == "'":
+                modus = None
+            else:
+                token.append(c)
+        else:  # modus == '"'
+            if c == '"':
+                modus = None
+            elif c == "\\" and i + 1 < len(line) and line[i + 1] in '$`"\\\n':
+                i += 1
+                token.append(line[i])
+            else:
+                token.append(c)
+        i += 1
+    if modus is not None:
+        raise KutipTakTertutup(modus)
+    if ada_token:
+        tokens.append(("kata", "".join(token)))
+    return tokens
+
+
+class SintaksSalah(Exception):
+    pass
+
+
+def parse_pipeline(tokens):
+    """Pecah token menjadi segmen pipeline + redirection per segmen.
+    Kembalikan list of (argv, masuk, keluar, mode_keluar)."""
+    segmen = []
+    argv, masuk, keluar, mode = [], None, None, "w"
+    i = 0
+    while i < len(tokens):
+        jenis, t = tokens[i]
+        if jenis == "op" and t == "|":
+            if not argv:
+                raise SintaksSalah("segmen kosong di pipeline")
+            segmen.append((argv, masuk, keluar, mode))
+            argv, masuk, keluar, mode = [], None, None, "w"
+        elif jenis == "op" and t in ("<", ">", ">>"):
+            if i + 1 >= len(tokens) or tokens[i + 1][0] == "op":
+                raise SintaksSalah(f"redirection {t} tanpa berkas tujuan")
+            if t == "<":
+                masuk = tokens[i + 1][1]
+            else:
+                keluar = tokens[i + 1][1]
+                mode = "a" if t == ">>" else "w"
+            i += 1
+        else:
+            argv.append(t)
+        i += 1
+    if not argv:
+        raise SintaksSalah("segmen kosong di pipeline")
+    segmen.append((argv, masuk, keluar, mode))
+    return segmen
+
+
+def _anak(seg, fd_masuk, pipa_keluar):
+    """Tubuh proses anak untuk satu segmen: pasang fd, lalu exec."""
+    argv, masuk, keluar, mode = seg
+    try:
+        if fd_masuk is not None:
+            os.dup2(fd_masuk, 0)
+            os.close(fd_masuk)
+        if pipa_keluar is not None:
+            os.close(pipa_keluar[0])
+            os.dup2(pipa_keluar[1], 1)
+            os.close(pipa_keluar[1])
+        if masuk is not None:
+            fd = os.open(masuk, os.O_RDONLY)
+            os.dup2(fd, 0)
+            os.close(fd)
+        if keluar is not None:
+            bendera = os.O_WRONLY | os.O_CREAT | (os.O_APPEND if mode == "a" else os.O_TRUNC)
+            fd = os.open(keluar, bendera, 0o644)
+            os.dup2(fd, 1)
+            os.close(fd)
+        os.execvp(argv[0], argv)
+    except OSError as e:
+        print(f"pysh: {argv[0]}: {e.strerror or e}", file=sys.stderr)
+    os._exit(1)  # _exit: jangan jalankan cleanup milik induk
+
+
+def launch_pipeline(segmen):
+    """Jalankan rantai segmen: satu anak per segmen, dihubungkan pipa.
+    Induk menutup ujung pipanya sendiri (kalau tidak, pembaca di hilir
+    tidak pernah melihat EOF) lalu menunggu semua anak."""
+    pids = []
+    fd_masuk = None
+    for idx, seg in enumerate(segmen):
+        pipa = os.pipe() if idx < len(segmen) - 1 else None
+        pid = os.fork()
+        if pid == 0:
+            _anak(seg, fd_masuk, pipa)
+        pids.append(pid)
+        if fd_masuk is not None:
+            os.close(fd_masuk)
+        if pipa is not None:
+            os.close(pipa[1])
+            fd_masuk = pipa[0]
+    for pid in pids:
+        while True:
+            _, status = os.waitpid(pid, os.WUNTRACED)
+            if os.WIFEXITED(status) or os.WIFSIGNALED(status):
+                break
+    return 1
+
+
+# ------------------------------------------------------------- builtins ---
+# Builtin berjalan di proses shell sendiri — itulah sebabnya cd bisa
+# mengubah direktori shell (direktori adalah milik proses) dan exit
+# bisa mengakhiri shell.
+
+def builtin_cd(args):
+    if len(args) < 2:
+        print('pysh: expected argument to "cd"', file=sys.stderr)
+    else:
+        try:
+            os.chdir(args[1])
+        except OSError as e:
+            print(f"pysh: {e.strerror or e}", file=sys.stderr)
+    return 1
+
+
+def builtin_help(args):
+    print("pysh — port Python dari LSH-nya Stephen Brennan")
+    print("Ketik nama program dan argumennya, lalu enter.")
+    print("Perintah bawaan:")
+    for name in BUILTINS:
+        print(" ", name)
+    print("Gunakan perintah man untuk informasi program lain.")
+    return 1
+
+
+def builtin_exit(args):
+    return 0
+
+
+BUILTINS = {
+    "cd": builtin_cd,
+    "help": builtin_help,
+    "exit": builtin_exit,
+}
+
+
+def execute(args):
+    if not args:
+        return 1  # baris kosong: abaikan
+    try:
+        segmen = parse_pipeline(args)
+    except SintaksSalah as e:
+        print(f"pysh: {e}", file=sys.stderr)
+        return 1
+    # Builtin hanya untuk perintah tunggal polos (lihat catatan header).
+    if len(segmen) == 1:
+        argv, masuk, keluar, _ = segmen[0]
+        if masuk is None and keluar is None and argv[0] in BUILTINS:
+            return BUILTINS[argv[0]](argv)
+    return launch_pipeline(segmen)
+
+
+def loop():
+    interaktif = sys.stdin.isatty()
+    status = 1
+    while status:
+        if interaktif:
+            print("> ", end="", flush=True)
+        line = read_line()
+        if line is None:  # EOF
+            if interaktif:
+                print()
+            break
+        try:
+            args = split_line(line)
+        except KutipTakTertutup:
+            print("pysh: kutip tidak tertutup", file=sys.stderr)
+            continue
+        status = execute(args)
+
+
+def main():
+    loop()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
